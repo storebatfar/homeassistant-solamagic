@@ -15,6 +15,7 @@ from homeassistant.helpers import device_registry as dr
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.typing import ConfigType
 
+from .bluetooth import is_valid_init_token
 from .client import SolamagicClient
 from .const import (
     CONF_COMMAND_CHAR,
@@ -181,7 +182,7 @@ async def async_setup_entry(
     # --- NEW: Log init-token at setup time (from handle 0x001F) and store  ---
     try:
         init_value = await client._ble.read_init_token()
-        if init_value and any(init_value):
+        if is_valid_init_token(init_value):
             hex_value = init_value.hex()
             _LOGGER.info("[%s] Init-token read during setup from handle 0x001F: %s", address, hex_value)
 

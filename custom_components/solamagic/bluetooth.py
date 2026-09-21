@@ -41,6 +41,20 @@ def _as_ha_error(err: Any, prefix: str) -> HomeAssistantError:
 def _hex(b: bytes) -> str:
     return binascii.hexlify(b).decode("utf-8")
 
+
+def is_valid_init_token(value: bytes | None) -> bool:
+    """
+    True if `value` looks like a real init token: FF FF FF FD [XX XX] 00 00 00.
+
+    Some heaters return a near-zero placeholder at the init handle instead of a
+    token (seen on firmware BTS1-0004: a 12-byte 00 01 00 00 ... value). A plain
+    "are all bytes zero?" test accepts that placeholder, which makes the stored
+    fallback unreachable and lets the placeholder overwrite a good saved token.
+    Check the documented shape instead.
+    """
+    return bool(value) and len(value) == 9 and value[0] == 0xFF
+
+
 # Handle candidates to try during auto-detection (standard first, then offset variants)
 HANDLE_INIT_CANDIDATES = [0x001F, 0x001E, 0x001D, 0x001C]
 
@@ -158,7 +172,7 @@ class SolamagicBleClient:
         for handle in HANDLE_INIT_CANDIDATES:
             try:
                 value = await client.read_gatt_char(handle)
-                if value and len(value) == 9 and value[0] == 0xFF:
+                if is_valid_init_token(value):
                     offset = handle - HANDLE_INIT
                     if offset != 0:
                         _LOGGER.warning(
@@ -422,7 +436,7 @@ class SolamagicBleClient:
 
         Flow:
         1. Read current value from detected HANDLE_INIT (offset-adjusted)
-        2. If value is all zeroes and we have fallback_init → use fallback
+        2. If the value read is not a valid token and we have fallback_init → use fallback
         3. Otherwise → use the value we read
         4. Write back the selected value
         5. Return the bytes that were actually written
@@ -439,18 +453,25 @@ class SolamagicBleClient:
                 _LOGGER.error("[%s] Failed to read init value: %s", self.address, e)
                 read_value = b""
 
-            all_zero = read_value and all(b == 0x00 for b in read_value)
-
-            # 2-3. Choose which value we should actually write
-            if all_zero and fallback_init:
-                init_value = fallback_init
-                _LOGGER.warning("[%s] Init value from device is all zeroes, using stored fallback: %s", self.address, _hex(init_value))
-            elif read_value:
+            # 2-3. Choose which value we should actually write.
+            # Trust what the device gives us only if it looks like a real token;
+            # otherwise the stored one from a previous connection is a better bet.
+            if is_valid_init_token(read_value):
                 init_value = read_value
                 _LOGGER.info("[%s] Echoing init value back to handle 0x%04X: %s", self.address, h_init, _hex(init_value))
-            elif fallback_init and read_value != fallback_init:
-                _LOGGER.info("[%s] Device init token changed (%s). Overriding with stored token: %s", self.address, _hex(read_value), _hex(fallback_init))
+            elif fallback_init:
                 init_value = fallback_init
+                _LOGGER.warning(
+                    "[%s] Init value from device is not a valid token (%s), using stored fallback: %s",
+                    self.address, _hex(read_value) if read_value else "empty", _hex(init_value),
+                )
+            elif read_value:
+                # No stored token to fall back on — echo what we got and hope for the best
+                init_value = read_value
+                _LOGGER.warning(
+                    "[%s] Init value from device is not a valid token (%s) and no token is stored; echoing it back",
+                    self.address, _hex(read_value),
+                )
             else:
                 # Last resort: use static INIT_PAYLOAD
                 init_value = INIT_PAYLOAD

@@ -5,7 +5,7 @@ import binascii
 
 from homeassistant.core import HomeAssistant
 
-from .bluetooth import SolamagicBleClient
+from .bluetooth import SolamagicBleClient, is_valid_init_token
 from .const import (
     CCCD_CMD,
     CCCD_ENABLE_DELAY_MS,
@@ -352,8 +352,10 @@ class SolamagicClient:
 
     async def _save_init_token(self, value: bytes) -> None:
         """Save init value in config entry (survives restart)."""
-        if not value or all(b == 0x00 for b in value):
-            return  # we don't store zeros
+        if not is_valid_init_token(value):
+            # Never let a placeholder overwrite a token we already have — that
+            # loss is permanent, the real token can only come back from the device.
+            return
 
         hex_value = binascii.hexlify(value).decode("ascii")
 
