@@ -1,6 +1,7 @@
 from __future__ import annotations
 import asyncio
 import binascii
+import contextlib
 import logging
 import time
 from typing import Any, Callable
@@ -84,7 +85,7 @@ class SolamagicBleClient:
         self.address = address.upper()
         self._client: BleakClientWithServiceCache | None = None
         self._lock = asyncio.Lock()
-        self._status_callback: Callable[[int], None] | None = None
+        self._status_callbacks: list[Callable[[int], None]] = []
         self._confirmation_callback: Callable[[bytes], None] | None = None
         self._disconnect_timer: asyncio.TimerHandle | None = None
         self._disconnect_timeout = disconnect_timeout
@@ -117,14 +118,28 @@ class SolamagicBleClient:
         self._expected_level_time = time.time()
         _LOGGER.debug("[%s] Set expected level: %d%% (will ignore different values for 1 second)", self.address, level)
 
-    def set_status_callback(self, callback: Callable[[int], None]) -> None:
+    def add_status_callback(self, callback: Callable[[int], None]) -> Callable[[], None]:
         """
-        Register callback for status updates.
+        Register a listener for status updates.
+
+        Several consumers want status at once — the climate entity, the power
+        sensor, and the poll's temporary collector — so this appends rather than
+        replaces. A single slot meant whoever registered last silently displaced
+        everyone before it.
 
         Args:
             callback: Function that accepts power level (int) as argument
+
+        Returns:
+            A callable that unregisters this listener again.
         """
-        self._status_callback = callback
+        self._status_callbacks.append(callback)
+
+        def _remove() -> None:
+            with contextlib.suppress(ValueError):
+                self._status_callbacks.remove(callback)
+
+        return _remove
 
     def _schedule_auto_disconnect(self) -> None:
         """
@@ -346,9 +361,10 @@ class SolamagicBleClient:
         if level == self._expected_level or time_since_expected >= 1.0:
             self._expected_level = None
 
-        if self._status_callback:
+        # Iterate a copy: a listener may unregister itself from inside the callback.
+        for callback in list(self._status_callbacks):
             try:
-                self._status_callback(level)
+                callback(level)
             except Exception as e:  # Broad catch OK: user callback, log and continue
                 _LOGGER.error("[%s] Status callback error: %s", self.address, e)
 

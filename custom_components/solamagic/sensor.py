@@ -101,7 +101,9 @@ class SolamagicPowerSensor(SensorEntity):
         await super().async_added_to_hass()
 
         # Register callback for real-time status updates
-        self._client._ble.set_status_callback(self._handle_status_update)
+        self.async_on_remove(
+            self._client._ble.add_status_callback(self._handle_status_update)
+        )
 
         # Start periodic polling
         self._cancel_poll = async_track_time_interval(
@@ -163,9 +165,10 @@ class SolamagicPowerSensor(SensorEntity):
                 received_status = level
                 _LOGGER.debug("[%s] Polled status: %d%%", self._address, level)
 
-            # Temporarily replace callback
-            old_callback = self._client._ble._status_callback
-            self._client._ble.set_status_callback(poll_callback)
+            # Add a temporary collector alongside the real listeners, rather than
+            # displacing them — a status that arrives during a poll should still
+            # reach the entities.
+            remove_poll_callback = self._client._ble.add_status_callback(poll_callback)
 
             try:
                 await self._client._ensure_initialized()
@@ -184,8 +187,7 @@ class SolamagicPowerSensor(SensorEntity):
                     _LOGGER.warning("[%s] No status received during poll (timeout)", self._address)
 
             finally:
-                # Restore original callback
-                self._client._ble.set_status_callback(old_callback)
+                remove_poll_callback()
 
             # Short delay before disconnect
             await asyncio.sleep(0.5)
