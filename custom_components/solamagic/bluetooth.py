@@ -55,6 +55,25 @@ def is_valid_init_token(value: bytes | None) -> bool:
     return bool(value) and len(value) == 9 and value[0] == 0xFF
 
 
+def decode_power_level(power: int, level: int) -> int | None:
+    """
+    Map a [power, level] pair to a percentage.
+
+    Used for both the 2-byte command-confirmation frame from 0x0028 and bytes
+    15/16 of the 20-byte status notification from 0x0032 — they share an encoding.
+    """
+    if power == 0x00:
+        return 0  # OFF
+    if power == 0x01:
+        if level == 0x21:  # 33 decimal
+            return 33
+        if level == 0x42:  # 66 decimal
+            return 66
+        if level == 0x64:  # 100 decimal
+            return 100
+    return None
+
+
 # Handle candidates to try during auto-detection (standard first, then offset variants)
 HANDLE_INIT_CANDIDATES = [0x001F, 0x001E, 0x001D, 0x001C]
 
@@ -300,18 +319,38 @@ class SolamagicBleClient:
 
         _LOGGER.debug("[%s] Status bytes: power=%#04x, level=%#04x", self.address, power, level)
 
-        # Map to percentage
-        if power == 0x00:
-            return 0  # OFF
-        elif power == 0x01:
-            if level == 0x21:  # 33 decimal
-                return 33
-            elif level == 0x42:  # 66 decimal
-                return 66
-            elif level == 0x64:  # 100 decimal
-                return 100
+        return decode_power_level(power, level)
 
-        return None
+    def _dispatch_level(self, level: int, source: str) -> None:
+        """
+        Hand a decoded level to the status callback, filtering stale values.
+
+        A notification that disagrees with a level we just commanded is dropped
+        for a second, so the heater's pre-command state doesn't overwrite it.
+        """
+        time_since_expected = time.time() - self._expected_level_time
+
+        if (self._expected_level is not None and
+            time_since_expected < 1.0 and
+            level != self._expected_level):
+            _LOGGER.debug(
+                "Ignoring stale notification: %d%% "
+                "(expected %d%%, sent %.1fs ago)",
+                level, self._expected_level, time_since_expected
+            )
+            return
+
+        _LOGGER.info("[%s] Heater status from %s: %d%%", self.address, source, level)
+
+        # Clear expected level if this matches or enough time passed
+        if level == self._expected_level or time_since_expected >= 1.0:
+            self._expected_level = None
+
+        if self._status_callback:
+            try:
+                self._status_callback(level)
+            except Exception as e:  # Broad catch OK: user callback, log and continue
+                _LOGGER.error("[%s] Status callback error: %s", self.address, e)
 
     def _notification_handler(self, sender, data: bytearray) -> None:
         """
@@ -352,6 +391,15 @@ class SolamagicBleClient:
                 except Exception as e:  # Broad catch OK: user callback, log and continue
                     _LOGGER.error("[%s] Confirmation callback error: %s", self.address, e)
 
+            # The frame is [power, level] — the same encoding as bytes 15/16 of the
+            # 20-byte status. The heater also sends it unprompted right after connect,
+            # so it doubles as a status source. That matters on units which have no
+            # characteristic at 0x0032: there the 20-byte notification never arrives
+            # and this is the only status we ever get.
+            level = decode_power_level(data_bytes[0], data_bytes[1])
+            if level is not None:
+                self._dispatch_level(level, "command channel")
+
         elif data_len >= 15:
             # This is status from handle 0x0032
             _LOGGER.debug("[%s] Status notification (%d bytes): %s", self.address, data_len, data_hex)
@@ -359,31 +407,7 @@ class SolamagicBleClient:
             # Parse status and notify callback
             level = self._parse_status(data_bytes)
             if level is not None:
-                # Check if we should ignore this notification
-                # (it might be stale if we just sent a command)
-                time_since_expected = time.time() - self._expected_level_time
-
-                if (self._expected_level is not None and
-                    time_since_expected < 1.0 and
-                    level != self._expected_level):
-                    _LOGGER.debug(
-                        "Ignoring stale notification: %d%% "
-                        "(expected %d%%, sent %.1fs ago)",
-                        level, self._expected_level, time_since_expected
-                    )
-                    return  # Ignore this stale notification
-
-                _LOGGER.info("[%s] Heater status from notification: %d%%", self.address, level)
-
-                # Clear expected level if this matches or enough time passed
-                if level == self._expected_level or time_since_expected >= 1.0:
-                    self._expected_level = None
-
-                if self._status_callback:
-                    try:
-                        self._status_callback(level)
-                    except Exception as e:  # Broad catch OK: user callback, log and continue
-                        _LOGGER.error("[%s] Status callback error: %s", self.address, e)
+                self._dispatch_level(level, "notification")
             else:
                 _LOGGER.debug("[%s] Could not parse level from status data", self.address)
 
